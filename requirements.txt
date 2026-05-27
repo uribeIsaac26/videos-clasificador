@@ -18,6 +18,10 @@ soundfile
 audioread
 yt-dlp
 
+# --- CLASIFICACIÓN Y MÉTRICAS ---
+scikit-learn
+scipy
+
 # --- UTILIDADES ---
 tqdm
 python-dotenv
