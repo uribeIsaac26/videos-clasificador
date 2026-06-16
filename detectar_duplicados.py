@@ -15,13 +15,9 @@ import gc
 # ============================================================
 load_dotenv()
 
-# --- TAG A ANALIZAR (cambiar para pruebas) ---
-TAG_BUSQUEDA = "Nature"
-
-# --- Umbral de similitud para considerar duplicado (0.0 - 1.0) ---
+TAG_BUSQUEDA     = "Nature"
 UMBRAL_DUPLICADO = 0.85
 
-# --- Rutas y modelos ---
 raw_path = os.getenv("BASE_PATH")
 if not raw_path:
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -66,16 +62,15 @@ def extraer_frames_uniformes(ruta_video, n=N_FRAMES):
 
 
 def obtener_embedding_vision(ruta_video):
-    """Embedding CLIP promediado sobre N frames. Devuelve np.array (512,)"""
     frames = extraer_frames_uniformes(ruta_video)
     if not frames:
         return None
 
     embeddings = []
     for frame in frames:
-        rgb  = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        pil  = Image.fromarray(rgb)
-        inp  = clip_processor(images=pil, return_tensors="pt").to(device)
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        pil = Image.fromarray(rgb)
+        inp = clip_processor(images=pil, return_tensors="pt").to(device)
 
         with torch.no_grad():
             out    = clip_model.get_image_features(**inp)
@@ -111,7 +106,6 @@ def conectar_db():
 
 
 def obtener_videos_por_tag(tag_name):
-    """Trae todos los videos que tienen el tag indicado."""
     conexion = conectar_db()
     cursor   = conexion.cursor(dictionary=True)
     cursor.execute("""
@@ -127,21 +121,29 @@ def obtener_videos_por_tag(tag_name):
     return videos
 
 
+def obtener_tags_de_video(cursor, video_id):
+    cursor.execute("""
+        SELECT t.name
+        FROM video_tag vt
+        JOIN tag t ON vt.tag_id = t.id
+        WHERE vt.video_id = %s
+        ORDER BY t.name
+    """, (video_id,))
+    return [row["name"] for row in cursor.fetchall()]
+
+
 def guardar_grupo_duplicados(conexion, tag_origen, miembros):
     """
-    Guarda un grupo de duplicados en la DB.
     miembros = [{"video_id": int, "similitud": float}, ...]
+    El primer elemento es el líder (similitud = 1.0).
     """
     cursor = conexion.cursor()
-
-    # 1. Insertar el grupo
     cursor.execute("""
         INSERT INTO video_duplicate_group (tag_origen, date_creation)
         VALUES (%s, %s)
     """, (tag_origen, datetime.now()))
     group_id = cursor.lastrowid
 
-    # 2. Insertar cada miembro del grupo
     for m in miembros:
         cursor.execute("""
             INSERT IGNORE INTO video_duplicate_member
@@ -154,25 +156,20 @@ def guardar_grupo_duplicados(conexion, tag_origen, miembros):
     return group_id
 
 # ============================================================
-# LÓGICA DE AGRUPACIÓN
+# LÓGICA DE AGRUPACIÓN (complete linkage)
 # ============================================================
 
 def construir_grupos(videos_con_embeddings, umbral):
     """
-    Algoritmo de agrupación por similitud (Union-Find simplificado):
-    - Compara cada par de videos
-    - Si su similitud >= umbral, los une en el mismo grupo
-    - Devuelve lista de grupos, cada grupo es lista de {video_id, similitud}
-
-    La similitud de cada miembro se calcula vs el video con
-    mayor similitud promedio dentro del grupo (el "líder").
+    Complete linkage: un video entra al grupo solo si su similitud
+    con TODOS los miembros actuales supera el umbral.
+    Esto evita grupos transitivos donde A≈B y B≈C pero A≠C.
     """
-    n       = len(videos_con_embeddings)
-    ids     = [v["id"] for v in videos_con_embeddings]
+    n          = len(videos_con_embeddings)
+    ids        = [v["id"] for v in videos_con_embeddings]
     embeddings = [v["embedding"] for v in videos_con_embeddings]
 
     # Matriz de similitud completa
-    print(f"  Calculando matriz de similitud ({n}x{n})...")
     matriz = np.zeros((n, n))
     for i in range(n):
         for j in range(i + 1, n):
@@ -180,36 +177,29 @@ def construir_grupos(videos_con_embeddings, umbral):
             matriz[i][j] = sim
             matriz[j][i] = sim
 
-    # Union-Find para agrupar
-    parent = list(range(n))
-
-    def find(x):
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-
-    def union(x, y):
-        parent[find(x)] = find(y)
+    asignado   = [False] * n
+    grupos_idx = []
 
     for i in range(n):
-        for j in range(i + 1, n):
-            if matriz[i][j] >= umbral:
-                union(i, j)
-
-    # Agrupar índices por raíz
-    grupos_idx = {}
-    for i in range(n):
-        raiz = find(i)
-        grupos_idx.setdefault(raiz, []).append(i)
-
-    # Solo nos interesan grupos con más de 1 video
-    grupos_duplicados = []
-    for raiz, indices in grupos_idx.items():
-        if len(indices) < 2:
+        if asignado[i]:
             continue
 
-        # El "líder" es el video con mayor similitud promedio al resto del grupo
+        grupo = {i}
+        for j in range(n):
+            if i == j or asignado[j]:
+                continue
+            # j entra al grupo solo si es similar a TODOS los miembros actuales
+            if all(matriz[j][k] >= umbral for k in grupo):
+                grupo.add(j)
+
+        if len(grupo) > 1:
+            for idx in grupo:
+                asignado[idx] = True
+            grupos_idx.append(list(grupo))
+
+    # Armar resultado con líder (mayor similitud promedio al resto)
+    resultado = []
+    for indices in grupos_idx:
         sims_promedio = []
         for i in indices:
             otros = [j for j in indices if j != i]
@@ -218,33 +208,31 @@ def construir_grupos(videos_con_embeddings, umbral):
 
         idx_lider = indices[np.argmax(sims_promedio)]
 
-        # Construir miembros con similitud vs el líder
         miembros = []
         for i in indices:
             sim_vs_lider = matriz[i][idx_lider] if i != idx_lider else 1.0
             miembros.append({
                 "video_id":  ids[i],
                 "similitud": round(float(sim_vs_lider), 4),
-                "es_lider":  i == idx_lider
+                "es_lider":  i == idx_lider,
             })
 
-        # Ordenar: líder primero, luego por similitud descendente
         miembros.sort(key=lambda x: (not x["es_lider"], -x["similitud"]))
-        grupos_duplicados.append(miembros)
+        resultado.append(miembros)
 
-    return grupos_duplicados
+    return resultado
 
 # ============================================================
 # FLUJO PRINCIPAL
 # ============================================================
 
 def detectar_duplicados(tag_name, umbral=UMBRAL_DUPLICADO):
-    print(f"\n{'='*55}")
+    print(f"\n{'='*60}")
     print(f"  Detector de Duplicados — tag: '{tag_name}'")
     print(f"  Umbral de similitud: {umbral*100:.0f}%")
-    print(f"{'='*55}\n")
+    print(f"{'='*60}\n")
 
-    # 1. Cargar memoria existente del pkl
+    # 1. Cargar embeddings del pkl si existe
     memoria_existente = {}
     if os.path.exists(MEMORIA_FILE):
         print(f"✅ Cargando memoria existente: {MEMORIA_FILE}")
@@ -256,83 +244,104 @@ def detectar_duplicados(tag_name, umbral=UMBRAL_DUPLICADO):
     else:
         print(f"⚠  No se encontró {MEMORIA_FILE}. Se generarán todos los embeddings.\n")
 
-    # 2. Traer videos del tag desde la DB
+    # 2. Traer todos los videos del tag desde DB
     print(f"🔍 Buscando videos con tag '{tag_name}'...")
     videos = obtener_videos_por_tag(tag_name)
-
     if not videos:
         print(f"  ❌ No se encontraron videos con el tag '{tag_name}'.")
         return
-
     print(f"  → {len(videos)} videos encontrados.\n")
 
-    # 3. Obtener embedding de cada video (pkl o generado)
-    videos_con_embeddings = []
-    for vid in videos:
-        ruta_completa = os.path.join(BASE_PATH, vid["video_path"])
-
-        if not os.path.exists(ruta_completa):
-            print(f"  ⚠ Archivo no encontrado, omitido: {vid['video_path']}")
-            continue
-
-        # ¿Ya está en la memoria?
-        if vid["video_path"] in memoria_existente:
-            emb = memoria_existente[vid["video_path"]]
-            print(f"  ✓ Video {vid['id']} — embedding desde .pkl")
-        else:
-            print(f"  ⚙ Video {vid['id']} — generando embedding...", end=" ")
-            emb = obtener_embedding_vision(ruta_completa)
-            if emb is None:
-                print("❌ falló, omitido.")
-                continue
-            print("✓")
-
-        videos_con_embeddings.append({
-            "id":        vid["id"],
-            "video_path": vid["video_path"],
-            "embedding": emb
-        })
-        gc.collect()
-
-    if len(videos_con_embeddings) < 2:
-        print("\n⚠  Necesitas al menos 2 videos con embeddings válidos para comparar.")
-        return
-
-    # 4. Construir grupos de duplicados
-    print(f"\n🔗 Buscando grupos de duplicados (umbral {umbral*100:.0f}%)...")
-    grupos = construir_grupos(videos_con_embeddings, umbral)
-
-    if not grupos:
-        print(f"\n✅ No se encontraron duplicados para el tag '{tag_name}' con umbral {umbral*100:.0f}%.")
-        return
-
-    print(f"\n📦 {len(grupos)} grupo(s) de duplicados encontrados.\n")
-
-    # 5. Guardar en la DB
+    # 3. Agrupar videos por fingerprint exacto de tags
+    print("🏷  Obteniendo perfil de tags por video...")
     conexion = conectar_db()
+    cursor   = conexion.cursor(dictionary=True)
+
+    fingerprint_map = {}
+    for video in videos:
+        tags        = obtener_tags_de_video(cursor, video["id"])
+        fingerprint = frozenset(tags)
+        fingerprint_map.setdefault(fingerprint, []).append(video)
+
+    cursor.close()
+    conexion.close()
+
+    # Solo interesan perfiles con 2+ videos (candidatos reales a duplicado)
+    candidatos       = {fp: vids for fp, vids in fingerprint_map.items() if len(vids) >= 2}
+    total_candidatos = sum(len(v) for v in candidatos.values())
+    descartados      = len(videos) - total_candidatos
+
+    print(f"  → {len(fingerprint_map)} perfil(es) de tags distintos")
+    print(f"  → {len(candidatos)} perfil(es) con 2+ videos ({total_candidatos} videos a comparar)")
+    print(f"  → {descartados} video(s) con perfil único, descartados\n")
+
+    if not candidatos:
+        print("✅ Ningún video comparte exactamente los mismos tags. No hay duplicados posibles.")
+        return
+
+    # 4. Por cada perfil: obtener embeddings y detectar duplicados
+    conexion         = conectar_db()
     grupos_guardados = 0
 
-    for i, miembros in enumerate(grupos, 1):
-        ids_grupo = [m["video_id"] for m in miembros]
-        sims      = [m["similitud"] for m in miembros if not m["es_lider"]]
-        sim_max   = max(sims) if sims else 1.0
-        sim_min   = min(sims) if sims else 1.0
+    for fingerprint, videos_grupo in candidatos.items():
+        tags_str = ", ".join(sorted(fingerprint))
+        print(f"─── [{tags_str}]  ({len(videos_grupo)} videos)")
 
-        print(f"  Grupo {i}: {len(miembros)} videos — "
-              f"similitud {sim_min*100:.1f}% a {sim_max*100:.1f}%")
-        print(f"    IDs: {ids_grupo}")
+        videos_con_embeddings = []
+        for vid in videos_grupo:
+            ruta = os.path.join(BASE_PATH, vid["video_path"])
+            if not os.path.exists(ruta):
+                print(f"    ⚠ Omitido (archivo no encontrado): {vid['video_path']}")
+                continue
 
-        # Guardar en DB (sin el campo es_lider, eso es solo interno)
-        miembros_db = [{"video_id": m["video_id"], "similitud": m["similitud"]} for m in miembros]
-        group_id    = guardar_grupo_duplicados(conexion, tag_name, miembros_db)
-        print(f"    ✓ Guardado como grupo #{group_id} en DB\n")
-        grupos_guardados += 1
+            if vid["video_path"] in memoria_existente:
+                emb = memoria_existente[vid["video_path"]]
+                print(f"    ✓ Video {vid['id']} — desde .pkl")
+            else:
+                print(f"    ⚙ Video {vid['id']} — generando embedding...", end=" ")
+                emb = obtener_embedding_vision(ruta)
+                if emb is None:
+                    print("❌ falló, omitido.")
+                    continue
+                print("✓")
+
+            videos_con_embeddings.append({
+                "id":         vid["id"],
+                "video_path": vid["video_path"],
+                "embedding":  emb,
+            })
+            gc.collect()
+
+        if len(videos_con_embeddings) < 2:
+            print("    ⚠ Menos de 2 embeddings válidos, se omite.\n")
+            continue
+
+        grupos = construir_grupos(videos_con_embeddings, umbral)
+
+        if not grupos:
+            print(f"    ✅ Sin duplicados con umbral {umbral*100:.0f}%\n")
+            continue
+
+        print(f"    📦 {len(grupos)} grupo(s) encontrado(s)")
+        for i, miembros in enumerate(grupos, 1):
+            ids_grupo = [m["video_id"] for m in miembros]
+            sims      = [m["similitud"] for m in miembros if not m["es_lider"]]
+            print(f"       Grupo {i}: IDs {ids_grupo} — "
+                  f"similitud {min(sims)*100:.1f}%-{max(sims)*100:.1f}%")
+
+            miembros_db = [{"video_id": m["video_id"], "similitud": m["similitud"]} for m in miembros]
+            group_id    = guardar_grupo_duplicados(conexion, tag_name, miembros_db)
+            print(f"       ✓ Guardado como grupo #{group_id} en DB")
+
+            grupos_guardados += 1
+
+        print()
 
     conexion.close()
 
-    print(f"{'='*55}")
+    print(f"{'='*60}")
     print(f"  ✅ {grupos_guardados} grupo(s) guardados para revisión.")
-    print(f"{'='*55}\n")
+    print(f"{'='*60}\n")
 
 
 # ============================================================
@@ -342,5 +351,5 @@ def detectar_duplicados(tag_name, umbral=UMBRAL_DUPLICADO):
 if __name__ == "__main__":
     detectar_duplicados(
         tag_name=TAG_BUSQUEDA,
-        umbral=UMBRAL_DUPLICADO
+        umbral=UMBRAL_DUPLICADO,
     )
