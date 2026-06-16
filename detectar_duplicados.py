@@ -139,9 +139,9 @@ def guardar_grupo_duplicados(conexion, tag_origen, miembros):
     """
     cursor = conexion.cursor()
     cursor.execute("""
-        INSERT INTO video_duplicate_group (tag_origen, date_creation)
-        VALUES (%s, %s)
-    """, (tag_origen, datetime.now()))
+        INSERT INTO video_duplicate_group (tag_origen, resuelto, date_creation)
+        VALUES (%s, %s, %s)
+    """, (tag_origen, 0, datetime.now()))
     group_id = cursor.lastrowid
 
     for m in miembros:
