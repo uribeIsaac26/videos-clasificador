@@ -16,7 +16,7 @@ import gc
 load_dotenv()
 
 TAG_BUSQUEDA     = "Nature"
-UMBRAL_DUPLICADO = 0.85
+UMBRAL_DUPLICADO = 0.95
 
 raw_path = os.getenv("BASE_PATH")
 if not raw_path:
