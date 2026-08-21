@@ -1,4 +1,5 @@
 import os
+import argparse
 import pickle
 import cv2
 import numpy as np
@@ -15,8 +16,8 @@ import gc
 # ============================================================
 load_dotenv()
 
-TAG_BUSQUEDA     = "Nature"
-UMBRAL_DUPLICADO = 0.95
+UMBRAL_DUPLICADO     = 1.0
+MIN_TAGS_COMPARTIDOS = 3
 
 raw_path = os.getenv("BASE_PATH")
 if not raw_path:
@@ -159,23 +160,28 @@ def guardar_grupo_duplicados(conexion, tag_origen, miembros):
 # LÓGICA DE AGRUPACIÓN (complete linkage)
 # ============================================================
 
-def construir_grupos(videos_con_embeddings, umbral):
+def construir_grupos(videos_con_embeddings, umbral, tags_map, min_tags_compartidos):
     """
-    Complete linkage: un video entra al grupo solo si su similitud
-    con TODOS los miembros actuales supera el umbral.
-    Esto evita grupos transitivos donde A≈B y B≈C pero A≠C.
+    Complete linkage: un video entra al grupo solo si, respecto a TODOS los
+    miembros actuales, su similitud visual supera el umbral Y comparte al
+    menos `min_tags_compartidos` tags. Esto evita grupos transitivos donde
+    A≈B y B≈C pero A≠C.
     """
     n          = len(videos_con_embeddings)
     ids        = [v["id"] for v in videos_con_embeddings]
     embeddings = [v["embedding"] for v in videos_con_embeddings]
 
-    # Matriz de similitud completa
-    matriz = np.zeros((n, n))
+    # Matriz de similitud y matriz de "cumple criterio completo" (similitud + tags)
+    matriz_sim    = np.zeros((n, n))
+    matriz_valida = np.zeros((n, n), dtype=bool)
     for i in range(n):
         for j in range(i + 1, n):
-            sim = similitud_coseno(embeddings[i], embeddings[j])
-            matriz[i][j] = sim
-            matriz[j][i] = sim
+            sim         = similitud_coseno(embeddings[i], embeddings[j])
+            compartidos = len(tags_map[ids[i]] & tags_map[ids[j]])
+            valida      = sim >= umbral and compartidos >= min_tags_compartidos
+
+            matriz_sim[i][j] = matriz_sim[j][i] = sim
+            matriz_valida[i][j] = matriz_valida[j][i] = valida
 
     asignado   = [False] * n
     grupos_idx = []
@@ -188,8 +194,8 @@ def construir_grupos(videos_con_embeddings, umbral):
         for j in range(n):
             if i == j or asignado[j]:
                 continue
-            # j entra al grupo solo si es similar a TODOS los miembros actuales
-            if all(matriz[j][k] >= umbral for k in grupo):
+            # j entra al grupo solo si cumple el criterio con TODOS los miembros actuales
+            if all(matriz_valida[j][k] for k in grupo):
                 grupo.add(j)
 
         if len(grupo) > 1:
@@ -203,14 +209,14 @@ def construir_grupos(videos_con_embeddings, umbral):
         sims_promedio = []
         for i in indices:
             otros = [j for j in indices if j != i]
-            prom  = np.mean([matriz[i][j] for j in otros])
+            prom  = np.mean([matriz_sim[i][j] for j in otros])
             sims_promedio.append(prom)
 
         idx_lider = indices[np.argmax(sims_promedio)]
 
         miembros = []
         for i in indices:
-            sim_vs_lider = matriz[i][idx_lider] if i != idx_lider else 1.0
+            sim_vs_lider = matriz_sim[i][idx_lider] if i != idx_lider else 1.0
             miembros.append({
                 "video_id":  ids[i],
                 "similitud": round(float(sim_vs_lider), 4),
@@ -252,40 +258,67 @@ def detectar_duplicados(tag_name, umbral=UMBRAL_DUPLICADO):
         return
     print(f"  → {len(videos)} videos encontrados.\n")
 
-    # 3. Agrupar videos por fingerprint exacto de tags
+    # 3. Agrupar videos por solapamiento de tags (>= MIN_TAGS_COMPARTIDOS)
     print("🏷  Obteniendo perfil de tags por video...")
     conexion = conectar_db()
     cursor   = conexion.cursor(dictionary=True)
 
-    fingerprint_map = {}
+    tags_map = {}
     for video in videos:
-        tags        = obtener_tags_de_video(cursor, video["id"])
-        fingerprint = frozenset(tags)
-        fingerprint_map.setdefault(fingerprint, []).append(video)
+        tags_map[video["id"]] = frozenset(obtener_tags_de_video(cursor, video["id"]))
 
     cursor.close()
     conexion.close()
 
-    # Solo interesan perfiles con 2+ videos (candidatos reales a duplicado)
-    candidatos       = {fp: vids for fp, vids in fingerprint_map.items() if len(vids) >= 2}
+    # Union-Find: agrupa en componentes conexas los videos que comparten al
+    # menos MIN_TAGS_COMPARTIDOS tags entre sí. Esto solo decide qué videos
+    # vale la pena comparar visualmente; los grupos finales de duplicados
+    # los arma construir_grupos con la similitud de embeddings.
+    padre = {v["id"]: v["id"] for v in videos}
+
+    def encontrar(x):
+        while padre[x] != x:
+            padre[x] = padre[padre[x]]
+            x = padre[x]
+        return x
+
+    def unir(x, y):
+        rx, ry = encontrar(x), encontrar(y)
+        if rx != ry:
+            padre[rx] = ry
+
+    ids_videos = [v["id"] for v in videos]
+    for i in range(len(ids_videos)):
+        for j in range(i + 1, len(ids_videos)):
+            id_i, id_j = ids_videos[i], ids_videos[j]
+            if len(tags_map[id_i] & tags_map[id_j]) >= MIN_TAGS_COMPARTIDOS:
+                unir(id_i, id_j)
+
+    componentes = {}
+    for video in videos:
+        raiz = encontrar(video["id"])
+        componentes.setdefault(raiz, []).append(video)
+
+    # Solo interesan componentes con 2+ videos (candidatos reales a duplicado)
+    candidatos       = {raiz: vids for raiz, vids in componentes.items() if len(vids) >= 2}
     total_candidatos = sum(len(v) for v in candidatos.values())
     descartados      = len(videos) - total_candidatos
 
-    print(f"  → {len(fingerprint_map)} perfil(es) de tags distintos")
-    print(f"  → {len(candidatos)} perfil(es) con 2+ videos ({total_candidatos} videos a comparar)")
-    print(f"  → {descartados} video(s) con perfil único, descartados\n")
+    print(f"  → {len(componentes)} componente(s) de tags")
+    print(f"  → {len(candidatos)} componente(s) con 2+ videos ({total_candidatos} videos a comparar)")
+    print(f"  → {descartados} video(s) sin afinidad de tags (< {MIN_TAGS_COMPARTIDOS} en común), descartados\n")
 
     if not candidatos:
-        print("✅ Ningún video comparte exactamente los mismos tags. No hay duplicados posibles.")
+        print(f"✅ Ningún par de videos comparte al menos {MIN_TAGS_COMPARTIDOS} tags. No hay duplicados posibles.")
         return
 
     # 4. Por cada perfil: obtener embeddings y detectar duplicados
     conexion         = conectar_db()
     grupos_guardados = 0
 
-    for fingerprint, videos_grupo in candidatos.items():
-        tags_str = ", ".join(sorted(fingerprint))
-        print(f"─── [{tags_str}]  ({len(videos_grupo)} videos)")
+    for videos_grupo in candidatos.values():
+        ids_str = ", ".join(str(v["id"]) for v in videos_grupo)
+        print(f"─── Componente de videos [{ids_str}]  ({len(videos_grupo)} videos)")
 
         videos_con_embeddings = []
         for vid in videos_grupo:
@@ -316,7 +349,7 @@ def detectar_duplicados(tag_name, umbral=UMBRAL_DUPLICADO):
             print("    ⚠ Menos de 2 embeddings válidos, se omite.\n")
             continue
 
-        grupos = construir_grupos(videos_con_embeddings, umbral)
+        grupos = construir_grupos(videos_con_embeddings, umbral, tags_map, MIN_TAGS_COMPARTIDOS)
 
         if not grupos:
             print(f"    ✅ Sin duplicados con umbral {umbral*100:.0f}%\n")
@@ -349,7 +382,17 @@ def detectar_duplicados(tag_name, umbral=UMBRAL_DUPLICADO):
 # ============================================================
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Detecta videos duplicados dentro de un tag.")
+    parser.add_argument("tag", help="Nombre del tag a analizar (ej: Nature)")
+    parser.add_argument(
+        "--umbral",
+        type=float,
+        default=UMBRAL_DUPLICADO,
+        help=f"Umbral de similitud visual, entre 0 y 1 (default: {UMBRAL_DUPLICADO})",
+    )
+    args = parser.parse_args()
+
     detectar_duplicados(
-        tag_name=TAG_BUSQUEDA,
-        umbral=UMBRAL_DUPLICADO,
+        tag_name=args.tag,
+        umbral=args.umbral,
     )

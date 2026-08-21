@@ -27,9 +27,10 @@ python -c "from ia_video_service import regenerar_memoria; regenerar_memoria()"
 # Print tag distribution and audio statistics for diagnostics
 python -c "from ia_video_service import diagnostico_memoria; diagnostico_memoria()"
 
-# Detect duplicates within a specific tag
-python detectar_duplicados.py  # edit TAG_BUSQUEDA at bottom of file first
-python -c "from detectar_duplicados import detectar_duplicados; detectar_duplicados('Nature', umbral=0.85)"
+# Detect duplicates within a specific tag (tag is a CLI argument)
+python detectar_duplicados.py Nature
+python detectar_duplicados.py Nature --umbral 0.98
+python -c "from detectar_duplicados import detectar_duplicados; detectar_duplicados('Nature', umbral=1.0)"
 ```
 
 ## Environment Variables (`.env` file required)
@@ -62,8 +63,10 @@ DB_DATABASE=...
 - Audio tags handled separately via binary detection (`hay_audio()`)
 
 **Duplicate detection:**
-- N×N cosine similarity matrix over all videos in a tag
-- Union-Find clusters pairs with similarity ≥ `UMBRAL_DUPLICADO` (0.85)
+- Tag name is passed as a CLI positional argument (`python detectar_duplicados.py <tag>`), not hardcoded
+- Videos are first grouped into connected components (Union-Find) by tag overlap: two videos are only compared visually if they share ≥ `MIN_TAGS_COMPARTIDOS` (3) tags
+- Within each component, N×N cosine similarity matrix is computed over visual embeddings
+- Complete-linkage clustering: a video joins a group only if it satisfies similarity ≥ `UMBRAL_DUPLICADO` (1.0) AND shares ≥ `MIN_TAGS_COMPARTIDOS` tags with EVERY current group member (avoids transitive false positives)
 - Group leader = video with highest average similarity to all group members
 
 **Persistence:**
@@ -78,7 +81,8 @@ DB_DATABASE=...
 | `K_VECINOS` | ia_video_service | `5` | Neighbors used in KNN voting |
 | `UMBRAL_SIMILITUD` | ia_video_service | `0.20` | Min cosine sim to include a neighbor |
 | `UMBRAL_VOTO` | ia_video_service | `0.30` | Min vote fraction for a tag to be assigned |
-| `UMBRAL_DUPLICADO` | detectar_duplicados | `0.85` | Cosine sim threshold to consider two videos duplicates |
+| `UMBRAL_DUPLICADO` | detectar_duplicados | `1.0` | Cosine sim threshold to consider two videos duplicates (overridable via `--umbral`) |
+| `MIN_TAGS_COMPARTIDOS` | detectar_duplicados | `3` | Min shared tags for two videos to be compared visually at all |
 
 ## Models Used
 
