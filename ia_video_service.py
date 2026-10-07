@@ -1,6 +1,7 @@
 import os
 import pickle
 import cv2
+import av
 import numpy as np
 import mysql.connector
 import torch
@@ -95,11 +96,21 @@ cargar_clap()
 def extraer_frames_uniformes(ruta_video, n=N_FRAMES):
     """
     Extrae N frames distribuidos uniformemente a lo largo del video.
+    Intenta primero con OpenCV; si no obtiene frames (p.ej. videos AV1 sin
+    aceleración por hardware), reintenta con PyAV, que decodifica AV1 por software.
     Devuelve lista de frames BGR o lista vacía si falla.
     """
+    frames = _extraer_frames_opencv(ruta_video, n)
+    if frames:
+        return frames
+
+    print(f"  ↻ OpenCV no pudo leer frames, reintentando con PyAV: {ruta_video}")
+    return _extraer_frames_pyav(ruta_video, n)
+
+
+def _extraer_frames_opencv(ruta_video, n):
     cap = cv2.VideoCapture(ruta_video)
     if not cap.isOpened():
-        print(f"  ⚠ No se pudo abrir: {ruta_video}")
         return []
 
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -117,6 +128,44 @@ def extraer_frames_uniformes(ruta_video, n=N_FRAMES):
 
     cap.release()
     return frames
+
+
+def _extraer_frames_pyav(ruta_video, n):
+    """
+    Extrae N frames uniformes con PyAV buscando por tiempo (no por índice).
+    Para cada instante objetivo hace seek al keyframe anterior y decodifica
+    hasta alcanzarlo.
+    """
+    try:
+        with av.open(ruta_video) as container:
+            if not container.streams.video:
+                print(f"  ⚠ Sin stream de video: {ruta_video}")
+                return []
+
+            stream = container.streams.video[0]
+            stream.thread_type = "AUTO"
+
+            if stream.duration is not None:
+                duracion = float(stream.duration * stream.time_base)
+            elif container.duration is not None:
+                duracion = container.duration / av.time_base
+            else:
+                print(f"  ⚠ Duración desconocida: {ruta_video}")
+                return []
+
+            tiempos = np.linspace(0, duracion, n, endpoint=False)
+            frames = []
+            for t in tiempos:
+                container.seek(int(t / stream.time_base), stream=stream, backward=True)
+                for frame in container.decode(stream):
+                    if frame.time is None or frame.time >= t:
+                        frames.append(frame.to_ndarray(format="bgr24"))
+                        break
+            return frames
+
+    except av.error.FFmpegError as e:
+        print(f"  ⚠ PyAV no pudo decodificar {ruta_video}: {e}")
+        return []
 
 
 def embedding_vision_frame(frame_bgr):

@@ -2,6 +2,7 @@ import os
 import argparse
 import pickle
 import cv2
+import av
 import numpy as np
 import mysql.connector
 import torch
@@ -44,6 +45,15 @@ print(f"  ✓ CLIP listo en {device.upper()}")
 # ============================================================
 
 def extraer_frames_uniformes(ruta_video, n=N_FRAMES):
+    # OpenCV primero; PyAV como plan B para códecs que OpenCV no decodifica (AV1)
+    frames = _extraer_frames_opencv(ruta_video, n)
+    if frames:
+        return frames
+    print(f"  ↻ OpenCV no pudo leer frames, reintentando con PyAV: {ruta_video}")
+    return _extraer_frames_pyav(ruta_video, n)
+
+
+def _extraer_frames_opencv(ruta_video, n):
     cap = cv2.VideoCapture(ruta_video)
     if not cap.isOpened():
         return []
@@ -60,6 +70,35 @@ def extraer_frames_uniformes(ruta_video, n=N_FRAMES):
             frames.append(frame)
     cap.release()
     return frames
+
+
+def _extraer_frames_pyav(ruta_video, n):
+    try:
+        with av.open(ruta_video) as container:
+            if not container.streams.video:
+                return []
+            stream = container.streams.video[0]
+            stream.thread_type = "AUTO"
+
+            if stream.duration is not None:
+                duracion = float(stream.duration * stream.time_base)
+            elif container.duration is not None:
+                duracion = container.duration / av.time_base
+            else:
+                return []
+
+            tiempos = np.linspace(0, duracion, n, endpoint=False)
+            frames = []
+            for t in tiempos:
+                container.seek(int(t / stream.time_base), stream=stream, backward=True)
+                for frame in container.decode(stream):
+                    if frame.time is None or frame.time >= t:
+                        frames.append(frame.to_ndarray(format="bgr24"))
+                        break
+            return frames
+    except av.error.FFmpegError as e:
+        print(f"  ⚠ PyAV no pudo decodificar {ruta_video}: {e}")
+        return []
 
 
 def obtener_embedding_vision(ruta_video):

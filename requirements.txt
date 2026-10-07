@@ -4,6 +4,7 @@ mysql-connector-python
 
 # --- VISIÓN Y PROCESAMIENTO ---
 opencv-python
+av
 Pillow
 
 # --- IA Y DEEP LEARNING ---
