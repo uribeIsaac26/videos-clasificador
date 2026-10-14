@@ -15,13 +15,13 @@ Multimodal AI video classification and duplicate detection system. It uses CLIP 
 # Install dependencies
 pip install -r requirements.txt
 
-# Build/rebuild the knowledge base (pickle) from all tagged videos in DB
-python ia_video_service.py  # calls generar_base_conocimiento() then procesar_lote()
+# Sync knowledge base incrementally and classify a batch
+python ia_video_service.py  # procesar_lote() calls sincronizar_memoria() first
 
-# Classify a batch of unclassified videos (default limit=5)
+# Classify a batch of unclassified videos (default limit=5); syncs memory first
 python -c "from ia_video_service import procesar_lote; procesar_lote(limite=10)"
 
-# Regenerate the knowledge base from scratch (deletes existing pickle)
+# Regenerate the knowledge base from scratch (only needed if the model/extraction changes)
 python -c "from ia_video_service import regenerar_memoria; regenerar_memoria()"
 
 # Print tag distribution and audio statistics for diagnostics
@@ -70,7 +70,7 @@ DB_DATABASE=...
 - Group leader = video with highest average similarity to all group members
 
 **Persistence:**
-- `memoria_multimodal_ia.pkl` — cached embeddings for all training videos (gitignored)
+- `memoria_multimodal_ia.pkl` — cached embeddings for all training videos (gitignored). Kept in sync incrementally by `sincronizar_memoria()` before every batch: embeds only new tagged videos, refreshes tags of existing ones (no re-embedding), drops untagged ones, recomputes if `video_path` changed. Written atomically (`.tmp` + `os.replace`), checkpointed every `GUARDAR_CADA` (100) new videos. Videos whose file is missing or whose visual embedding fails are not stored and are retried on the next sync.
 - MySQL DB — source of video paths/tags and destination for classification/duplicate results
 
 ## Key Tuning Constants

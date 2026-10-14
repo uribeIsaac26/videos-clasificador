@@ -271,67 +271,139 @@ def conectar_db():
 # GENERACIÓN DE MEMORIA (ENTRENAMIENTO)
 # ============================================================
 
+# Cada cuántos videos nuevos se guarda la memoria en disco durante la sincronización,
+# para no perder el progreso si el proceso se interrumpe a mitad de una carga grande.
+GUARDAR_CADA = 100
+
+
+def obtener_videos_etiquetados():
+    """Devuelve {video_id: {"video_path", "etiquetas"}} con todos los videos etiquetados en la DB."""
+    conexion = conectar_db()
+    cursor   = conexion.cursor(dictionary=True)
+    cursor.execute("""
+        SELECT v.id, v.video_path, GROUP_CONCAT(t.name SEPARATOR ',') AS etiquetas
+        FROM video v
+        JOIN video_tag vt ON v.id = vt.video_id
+        JOIN tag t ON vt.tag_id = t.id
+        GROUP BY v.id
+    """)
+    filas = cursor.fetchall()
+    cursor.close()
+    conexion.close()
+
+    return {
+        fila["id"]: {
+            "video_path": fila["video_path"],
+            "etiquetas":  [t.strip() for t in fila["etiquetas"].split(",") if t.strip()],
+        }
+        for fila in filas
+    }
+
+
+def cargar_memoria():
+    """Lee la memoria de disco; lista vacía si no existe."""
+    if not os.path.exists(MEMORIA_FILE):
+        return []
+    with open(MEMORIA_FILE, "rb") as f:
+        return pickle.load(f)
+
+
+def guardar_memoria(memoria):
+    """
+    Escribe la memoria de forma atómica (archivo temporal + rename), así un corte
+    a mitad de escritura no deja el pickle corrupto ni lo ve a medias detectar_duplicados.
+    """
+    tmp = MEMORIA_FILE + ".tmp"
+    with open(tmp, "wb") as f:
+        pickle.dump(memoria, f)
+    os.replace(tmp, MEMORIA_FILE)
+
+
+def calcular_entrada_memoria(video_id, video_path, etiquetas):
+    """Extrae embeddings de un video. Devuelve el registro de memoria o None si no se pudo."""
+    ruta = os.path.join(BASE_PATH, video_path)
+    if not os.path.exists(ruta):
+        print(f"  ⚠ Archivo no encontrado, omitido: {ruta}")
+        return None
+
+    emb_v = obtener_embedding_vision(ruta)
+    if np.all(emb_v == 0):
+        # No se guarda: un embedding vacío no aporta al KNN y así se reintenta en la próxima sincronización
+        print(f"  ⚠ No se pudo extraer visual del video {video_id}, omitido.")
+        return None
+
+    emb_a = obtener_embedding_audio(ruta)
+    return {
+        "video_id":    video_id,
+        "video_path":  video_path,
+        "embedding_v": emb_v,                            # (512,)  — solo visual
+        "embedding_a": emb_a,                            # (512,)  — solo audio
+        "embedding_c": combinar_embeddings(emb_v, emb_a),  # (1024,) — combinado
+        "etiquetas":   etiquetas,
+        "tiene_audio": hay_audio(emb_a),
+    }
+
+
+def sincronizar_memoria():
+    """
+    Pone la memoria al día con la DB de forma incremental:
+      - Videos etiquetados que no están en memoria → calcula sus embeddings.
+      - Videos ya en memoria → refresca sus etiquetas (sin recalcular embeddings);
+        si cambió su video_path, recalcula.
+      - Videos que ya no están etiquetados en la DB → los quita.
+    Devuelve la memoria sincronizada.
+    """
+    print("\n🔄 Sincronizando memoria con la base de datos...")
+    en_db   = obtener_videos_etiquetados()
+    memoria = cargar_memoria()
+
+    actualizados = 0
+    eliminados   = 0
+    vigentes     = []
+    for m in memoria:
+        info = en_db.get(m["video_id"])
+        if info is None or info["video_path"] != m["video_path"]:
+            eliminados += 1  # si solo cambió la ruta, se vuelve a calcular abajo como nuevo
+            continue
+        if m["etiquetas"] != info["etiquetas"]:
+            m["etiquetas"] = info["etiquetas"]
+            actualizados += 1
+        vigentes.append(m)
+
+    ids_en_memoria = {m["video_id"] for m in vigentes}
+    nuevos = [vid_id for vid_id in en_db if vid_id not in ids_en_memoria]
+
+    print(f"  → En DB: {len(en_db)} | En memoria: {len(vigentes)} | "
+          f"Nuevos: {len(nuevos)} | Tags actualizados: {actualizados} | Eliminados: {eliminados}")
+
+    agregados = 0
+    for n, vid_id in enumerate(nuevos, start=1):
+        info = en_db[vid_id]
+        print(f"  [{n}/{len(nuevos)}] Procesando video {vid_id}...", end=" ")
+        entrada = calcular_entrada_memoria(vid_id, info["video_path"], info["etiquetas"])
+        if entrada is None:
+            continue
+        vigentes.append(entrada)
+        agregados += 1
+        print(f"✓  [{', '.join(info['etiquetas'])}]")
+
+        if agregados % GUARDAR_CADA == 0:
+            guardar_memoria(vigentes)
+            print(f"  💾 Progreso guardado ({len(vigentes)} videos en memoria).")
+        gc.collect()
+
+    if agregados or actualizados or eliminados or not os.path.exists(MEMORIA_FILE):
+        guardar_memoria(vigentes)
+        print(f"✅ Memoria actualizada: {len(vigentes)} videos → {MEMORIA_FILE}")
+    else:
+        print("✅ Memoria ya estaba al día.")
+
+    return vigentes
+
+
 def generar_base_conocimiento():
-    """
-    Recorre todos los videos etiquetados en la DB,
-    extrae embeddings multimodales y guarda la memoria en disco.
-    """
-    print("\n🔄 Generando base de conocimiento multimodal...")
-    try:
-        conexion = conectar_db()
-        cursor   = conexion.cursor(dictionary=True)
-        cursor.execute("""
-            SELECT v.id, v.video_path, GROUP_CONCAT(t.name SEPARATOR ',') AS etiquetas
-            FROM video v
-            JOIN video_tag vt ON v.id = vt.video_id
-            JOIN tag t ON vt.tag_id = t.id
-            GROUP BY v.id
-        """)
-        videos = cursor.fetchall()
-        cursor.close()
-        conexion.close()
-
-        if not videos:
-            print("  ❌ No hay videos etiquetados en la base de datos.")
-            return
-
-        memoria = []
-        for vid in videos:
-            ruta = os.path.join(BASE_PATH, vid["video_path"])
-            if not os.path.exists(ruta):
-                print(f"  ⚠ Archivo no encontrado, omitido: {ruta}")
-                continue
-
-            print(f"  Procesando video {vid['id']}...", end=" ")
-
-            emb_v = obtener_embedding_vision(ruta)
-            emb_a = obtener_embedding_audio(ruta)
-            emb_c = combinar_embeddings(emb_v, emb_a)
-
-            # Parsear etiquetas limpias
-            etiquetas = [t.strip() for t in vid["etiquetas"].split(",") if t.strip()]
-
-            memoria.append({
-                "video_id":    vid["id"],
-                "video_path":  vid["video_path"],
-                "embedding_v": emb_v,   # (512,)  — solo visual
-                "embedding_a": emb_a,   # (512,)  — solo audio
-                "embedding_c": emb_c,   # (1024,) — combinado
-                "etiquetas":   etiquetas,
-                "tiene_audio": hay_audio(emb_a),
-            })
-            print(f"✓  [{', '.join(etiquetas)}]")
-
-            gc.collect()
-
-        with open(MEMORIA_FILE, "wb") as f:
-            pickle.dump(memoria, f)
-
-        print(f"\n✅ Memoria guardada con {len(memoria)} videos → {MEMORIA_FILE}")
-
-    except Exception as e:
-        print(f"\n❌ Error en generación: {e}")
-        raise
+    """Se mantiene por compatibilidad: ahora solo sincroniza de forma incremental."""
+    return sincronizar_memoria()
 
 # ============================================================
 # CLASIFICACIÓN DE NUEVO VIDEO
@@ -453,17 +525,12 @@ def procesar_lote(limite=5):
     Obtiene videos sin clasificar de la DB,
     los clasifica y guarda los resultados en video_tag_temporal.
     """
-    # Cargar o generar memoria
-    if not os.path.exists(MEMORIA_FILE):
-        print(f"⚠ {MEMORIA_FILE} no encontrado. Generando...")
-        generar_base_conocimiento()
+    # Antes de clasificar, incorporar los videos etiquetados/corregidos desde la última ejecución
+    memoria = sincronizar_memoria()
 
-    if not os.path.exists(MEMORIA_FILE):
-        print("❌ No se pudo crear la memoria. Abortando.")
+    if not memoria:
+        print("❌ La memoria está vacía. Abortando.")
         return
-
-    with open(MEMORIA_FILE, "rb") as f:
-        memoria = pickle.load(f)
 
     print(f"\n📦 Memoria cargada: {len(memoria)} videos de entrenamiento.")
 
@@ -511,11 +578,11 @@ def procesar_lote(limite=5):
 # ============================================================
 
 def regenerar_memoria():
-    """Borra la memoria existente y la regenera desde cero."""
+    """Borra la memoria existente y la regenera desde cero (solo necesario si cambia el modelo o la extracción)."""
     if os.path.exists(MEMORIA_FILE):
         os.remove(MEMORIA_FILE)
         print(f"🗑  Memoria anterior eliminada.")
-    generar_base_conocimiento()
+    sincronizar_memoria()
 
 
 def diagnostico_memoria():
@@ -552,14 +619,11 @@ if __name__ == "__main__":
         print(f"  Servicio de IA Multimodal — {datetime.now():%Y-%m-%d %H:%M:%S}")
         print(f"{'='*55}\n")
 
-        # Mostrar diagnóstico si ya existe memoria
+        # Mostrar diagnóstico de la memoria actual (si existe)
         if os.path.exists(MEMORIA_FILE):
             diagnostico_memoria()
-        else:
-            print(f"⚠  {MEMORIA_FILE} no encontrado. Se generará ahora.")
-            generar_base_conocimiento()
 
-        # Clasificar lote
+        # Clasificar lote (sincroniza la memoria incrementalmente antes de clasificar)
         procesar_lote(limite=5)
 
         print(f"\n{'='*55}")
