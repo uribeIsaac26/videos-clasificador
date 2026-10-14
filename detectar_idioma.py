@@ -1,18 +1,24 @@
 """
-Detección del idioma hablado en un video con faster-whisper + VAD (Silero).
+Detección de idioma hablado y de música en un video.
 
-Resultado por video:
-  - Nombre del idioma en inglés (ej. "Spanish") → hay voz y Whisper está seguro.
-  - TAG_MUSICA ("Music")                        → hay sonido pero no hay voz.
-  - None                                        → silencio, voz con idioma dudoso o error.
+  - Música: AST (clasificador de sonidos entrenado en AudioSet) decide si la música es lo
+    dominante. Alguien hablando con música de fondo NO cuenta como música.
+  - Idioma: faster-whisper sobre los tramos con voz (VAD Silero), solo si AST también
+    confirma habla o canto (evita que Whisper "invente" idioma con ruido o instrumentales).
 
-Las canciones con letra cuentan como voz: se etiquetan con el idioma de la letra.
+Tags resultantes por video:
+  | Audio                                   | Tags                 |
+  | Ruido / sonido de fondo                 | (ninguno)            |
+  | Canción instrumental                    | Music                |
+  | Canción con letra                       | Music + idioma letra |
+  | Persona hablando (con o sin música)     | idioma               |
 """
 import numpy as np
 import librosa
 import torch
 from faster_whisper import WhisperModel
 from faster_whisper.vad import VadOptions, get_speech_timestamps
+from transformers import ASTFeatureExtractor, ASTForAudioClassification
 
 # ============================================================
 # CONFIGURACIÓN
@@ -35,6 +41,30 @@ UMBRAL_IDIOMA = 0.60
 
 # Energía RMS por debajo de la cual se considera silencio (mismo criterio que ia_video_service)
 UMBRAL_SILENCIO_RMS = 1e-4
+
+# --- Música (AST) ---
+MODELO_AST = "MIT/ast-finetuned-audioset-10-10-0.4593"
+DURACION_TROZO_AST = 10.0   # AST analiza ~10 s por entrada; cada ventana se parte en trozos
+
+# Una ventana tiene "música dominante" si P(música) ≥ UMBRAL_MUSICA y además hay canto
+# (P(canto) ≥ UMBRAL_CANTO) o no hay habla (P(habla) < UMBRAL_HABLA).
+UMBRAL_MUSICA = 0.50
+UMBRAL_CANTO  = 0.30
+UMBRAL_HABLA  = 0.50
+
+# Fracción mínima de ventanas con música dominante para etiquetar el video como Music
+FRACCION_MUSICA = 0.5
+
+# En videos SIN música, para aceptar el idioma de Whisper AST debe ver habla o canto con al
+# menos esta probabilidad en alguna ventana (el VAD solo a veces confunde ruido con voz).
+# En videos CON música no se exige: AST suele dar poco "canto" en canciones mezcladas, y ahí
+# el filtro lo hacen el VAD (0 s de voz en instrumentales) y la confianza de Whisper.
+UMBRAL_VOZ_AST = 0.30
+
+# Índices de AudioSet (id2label del modelo AST)
+IDX_MUSICA = [137]                                         # Music
+IDX_HABLA  = [0, 1, 2, 3, 4, 5, 7]                         # Speech, Male/Female/Child speech, Conversation, Narration, Speech synthesizer
+IDX_CANTO  = [27, 28, 32, 33, 34, 35, 36, 37, 254, 255, 266]  # Singing, Choir, ...singing, Rapping, Humming, Vocal music, A capella, Song
 
 TAG_MUSICA = "Music"
 
@@ -66,22 +96,32 @@ IDIOMAS_WHISPER = {
 TAGS_IDIOMA_Y_MUSICA = {n.lower() for n in IDIOMAS_WHISPER.values()} | {TAG_MUSICA.lower()}
 
 # ============================================================
-# MODELO (carga perezosa: solo se carga si realmente se detecta idioma)
+# MODELOS (carga perezosa: solo se cargan si hay audio que analizar)
 # ============================================================
 
-_modelo = None
+_device = "cuda" if torch.cuda.is_available() else "cpu"
+_whisper = None
+_ast = None
 
 
-def _obtener_modelo():
-    global _modelo
-    if _modelo is None:
-        if torch.cuda.is_available():
-            device, compute_type = "cuda", "float16"
-        else:
-            device, compute_type = "cpu", "int8"
-        print(f"  Cargando Whisper '{MODELO_WHISPER}' ({device.upper()})...")
-        _modelo = WhisperModel(MODELO_WHISPER, device=device, compute_type=compute_type)
-    return _modelo
+def _obtener_whisper():
+    global _whisper
+    if _whisper is None:
+        compute_type = "float16" if _device == "cuda" else "int8"
+        print(f"  Cargando Whisper '{MODELO_WHISPER}' ({_device.upper()})...")
+        _whisper = WhisperModel(MODELO_WHISPER, device=_device, compute_type=compute_type)
+    return _whisper
+
+
+def _obtener_ast():
+    global _ast
+    if _ast is None:
+        print(f"  Cargando AST para detección de música ({_device.upper()})...")
+        extractor = ASTFeatureExtractor.from_pretrained(MODELO_AST)
+        modelo = ASTForAudioClassification.from_pretrained(MODELO_AST).to(_device)
+        modelo.eval()
+        _ast = (extractor, modelo)
+    return _ast
 
 # ============================================================
 # DETECCIÓN
@@ -125,13 +165,57 @@ def _solo_voz(audio):
     return voz, voz.size / SAMPLE_RATE
 
 
+def _probabilidades_sonido(audio):
+    """
+    Corre AST sobre la ventana (partida en trozos de ~10 s) y devuelve
+    (P(música), P(habla), P(canto)) promediadas entre trozos.
+    """
+    extractor, modelo = _obtener_ast()
+    paso = int(DURACION_TROZO_AST * SAMPLE_RATE)
+    trozos = [audio[i:i + paso] for i in range(0, len(audio), paso)]
+    trozos = [t for t in trozos if t.size >= SAMPLE_RATE] or [audio]  # descarta colas < 1 s
+
+    entradas = extractor(trozos, sampling_rate=SAMPLE_RATE, return_tensors="pt").to(_device)
+    with torch.no_grad():
+        probs = torch.sigmoid(modelo(**entradas).logits).cpu().numpy()  # multi-etiqueta
+
+    musica = probs[:, IDX_MUSICA].max(axis=1).mean()
+    habla  = probs[:, IDX_HABLA].max(axis=1).mean()
+    canto  = probs[:, IDX_CANTO].max(axis=1).mean()
+    return float(musica), float(habla), float(canto)
+
+
+def _musica_dominante(p_musica, p_habla, p_canto):
+    return p_musica >= UMBRAL_MUSICA and (p_canto >= UMBRAL_CANTO or p_habla < UMBRAL_HABLA)
+
+
+def _detectar_lengua(ventanas):
+    """Whisper sobre los tramos con voz. Devuelve (codigo, probabilidad, segundos_voz)."""
+    votos     = {}
+    total_voz = 0.0
+    for audio in ventanas:
+        voz, segundos = _solo_voz(audio)
+        if segundos < 1.0:
+            continue
+        _, _, probabilidades = _obtener_whisper().detect_language(audio=voz)
+        for codigo, prob in probabilidades:
+            votos[codigo] = votos.get(codigo, 0.0) + prob * segundos  # ponderado por segundos de voz
+        total_voz += segundos
+
+    if total_voz < MIN_SEGUNDOS_VOZ:
+        return None, None, round(total_voz, 1)
+    codigo, peso = max(votos.items(), key=lambda kv: kv[1])
+    return codigo, peso / total_voz, round(total_voz, 1)
+
+
 def detectar_idioma(ruta_video):
     """
-    Detecta el idioma hablado del video.
-    Devuelve dict {"tag", "codigo", "probabilidad", "segundos_voz"}; "tag" puede ser
-    un idioma, TAG_MUSICA o None (ver docstring del módulo).
+    Detecta música e idioma hablado del video.
+    Devuelve dict con "tags" (lista: Music y/o idioma, puede ir vacía) y el detalle
+    de la detección para el registro.
     """
-    resultado = {"tag": None, "codigo": None, "probabilidad": None, "segundos_voz": 0.0}
+    resultado = {"tags": [], "idioma": None, "codigo": None, "probabilidad": None,
+                 "segundos_voz": 0.0, "prob_musica": None, "prob_habla": None, "prob_canto": None}
 
     try:
         ventanas = _cargar_ventanas(ruta_video)
@@ -139,35 +223,34 @@ def detectar_idioma(ruta_video):
         print(f"  ⚠ No se pudo leer el audio para idioma de {ruta_video}: {e}")
         return resultado
 
-    if not ventanas or all(np.sqrt(np.mean(v ** 2)) < UMBRAL_SILENCIO_RMS for v in ventanas):
+    ventanas = [v for v in ventanas if np.sqrt(np.mean(v ** 2)) >= UMBRAL_SILENCIO_RMS]
+    if not ventanas:
         return resultado  # silencio: lo cubre el tag de "No sound"
 
-    # Votación ponderada por segundos de voz: cada ventana con habla aporta sus probabilidades
-    votos       = {}
-    total_voz   = 0.0
-    modelo      = None
-    for audio in ventanas:
-        voz, segundos = _solo_voz(audio)
-        if segundos < 1.0:
-            continue
-        modelo = modelo or _obtener_modelo()
-        _, _, probabilidades = modelo.detect_language(audio=voz)
-        for codigo, prob in probabilidades:
-            votos[codigo] = votos.get(codigo, 0.0) + prob * segundos
-        total_voz += segundos
+    # --- Música: ¿domina en suficientes ventanas? ---
+    sonidos = [_probabilidades_sonido(v) for v in ventanas]
+    con_musica = sum(_musica_dominante(*p) for p in sonidos)
+    es_musica = con_musica / len(sonidos) >= FRACCION_MUSICA
 
-    resultado["segundos_voz"] = round(total_voz, 1)
+    resultado["prob_musica"] = round(max(p[0] for p in sonidos), 3)
+    resultado["prob_habla"]  = round(max(p[1] for p in sonidos), 3)
+    resultado["prob_canto"]  = round(max(p[2] for p in sonidos), 3)
 
-    if total_voz < MIN_SEGUNDOS_VOZ:
-        resultado["tag"] = TAG_MUSICA  # hay sonido pero no habla
-        return resultado
+    # --- Idioma (letra de la canción o habla) ---
+    hay_voz = es_musica or max(resultado["prob_habla"], resultado["prob_canto"]) >= UMBRAL_VOZ_AST
+    if hay_voz:
+        codigo, probabilidad, segundos = _detectar_lengua(ventanas)
+        resultado["segundos_voz"] = segundos
+        if codigo is not None:
+            resultado["codigo"]       = codigo
+            resultado["probabilidad"] = round(probabilidad, 3)
+            if probabilidad >= UMBRAL_IDIOMA:
+                resultado["idioma"] = nombre_idioma(codigo)
 
-    codigo, peso = max(votos.items(), key=lambda kv: kv[1])
-    probabilidad = peso / total_voz
-    resultado["codigo"]       = codigo
-    resultado["probabilidad"] = round(probabilidad, 3)
-    if probabilidad >= UMBRAL_IDIOMA:
-        resultado["tag"] = nombre_idioma(codigo)
+    if es_musica:
+        resultado["tags"].append(TAG_MUSICA)
+    if resultado["idioma"]:
+        resultado["tags"].append(resultado["idioma"])
     return resultado
 
 # ============================================================

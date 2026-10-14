@@ -469,7 +469,7 @@ def clasificar_video_nuevo(ruta_relativa, memoria):
       1. Similitud coseno contra embeddings del entrenamiento (visión)
       2. Votación ponderada de los K vecinos más similares
       3. Detección binaria de audio (sonido / silencio)
-      4. Idioma hablado con Whisper (o "Music" si hay sonido sin voz)
+      4. Música (AST) e idioma hablado / de la letra (Whisper)
     """
     ruta_completa = os.path.join(BASE_PATH, ruta_relativa)
     if not os.path.exists(ruta_completa):
@@ -515,12 +515,12 @@ def clasificar_video_nuevo(ruta_relativa, memoria):
     tag_audio = tag_con_audio if hay_audio(emb_a_nuevo) else tag_sin_audio
 
     # --- Idioma hablado / música (solo si hay sonido) ---
-    tag_idioma = None
+    tags_idioma = []
     if hay_audio(emb_a_nuevo):
-        tag_idioma = detectar_idioma(ruta_completa)["tag"]
+        tags_idioma = detectar_idioma(ruta_completa)["tags"]
 
     # --- Resultado final ---
-    tags_finales = sorted(set(tags_visuales) | {tag_audio, tag_idioma} - {None})
+    tags_finales = sorted(set(tags_visuales) | {tag_audio} | set(tags_idioma))
     tags_finales = [t for t in tags_finales if t]  # limpiar vacíos
 
     return ", ".join(tags_finales)
