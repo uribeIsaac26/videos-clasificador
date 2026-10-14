@@ -16,6 +16,7 @@ from sklearn.preprocessing import MultiLabelBinarizer
 from sklearn.multioutput import MultiOutputClassifier
 from sklearn.linear_model import LogisticRegression
 from scipy.spatial.distance import cosine
+from detectar_idioma import detectar_idioma, asegurar_tags_video, TAGS_IDIOMA_Y_MUSICA
 import gc
 import warnings
 warnings.filterwarnings("ignore")
@@ -428,9 +429,11 @@ def votar_tags(vecinos_etiquetas, similitudes, umbral_voto=UMBRAL_VOTO):
 
     for etiquetas, sim in zip(vecinos_etiquetas, similitudes):
         for tag in etiquetas:
-            # Excluimos tags de audio — se manejan aparte
+            # Excluimos tags de audio, idioma y música — se detectan aparte, no por parecido visual
             tag_lower = tag.lower()
             if tag_lower in {"sound", "sonido", "no sound", "sin sonido", "silencio", "mute"}:
+                continue
+            if tag_lower in TAGS_IDIOMA_Y_MUSICA:
                 continue
             conteo[tag] = conteo.get(tag, 0) + sim
 
@@ -466,6 +469,7 @@ def clasificar_video_nuevo(ruta_relativa, memoria):
       1. Similitud coseno contra embeddings del entrenamiento (visión)
       2. Votación ponderada de los K vecinos más similares
       3. Detección binaria de audio (sonido / silencio)
+      4. Idioma hablado con Whisper (o "Music" si hay sonido sin voz)
     """
     ruta_completa = os.path.join(BASE_PATH, ruta_relativa)
     if not os.path.exists(ruta_completa):
@@ -510,8 +514,13 @@ def clasificar_video_nuevo(ruta_relativa, memoria):
     tag_con_audio, tag_sin_audio = detectar_tags_audio_del_entreno(memoria)
     tag_audio = tag_con_audio if hay_audio(emb_a_nuevo) else tag_sin_audio
 
+    # --- Idioma hablado / música (solo si hay sonido) ---
+    tag_idioma = None
+    if hay_audio(emb_a_nuevo):
+        tag_idioma = detectar_idioma(ruta_completa)["tag"]
+
     # --- Resultado final ---
-    tags_finales = sorted(set(tags_visuales) | {tag_audio})
+    tags_finales = sorted(set(tags_visuales) | {tag_audio, tag_idioma} - {None})
     tags_finales = [t for t in tags_finales if t]  # limpiar vacíos
 
     return ", ".join(tags_finales)
@@ -557,6 +566,9 @@ def procesar_lote(limite=5):
             tags = clasificar_video_nuevo(vid["video_path"], memoria)
 
             if tags:
+                # El frontend ignora sugerencias cuyo tag no existe; un idioma nuevo hay que crearlo
+                asegurar_tags_video(cursor, [t.strip() for t in tags.split(",")
+                                             if t.strip().lower() in TAGS_IDIOMA_Y_MUSICA])
                 cursor.execute("""
                     INSERT INTO video_tag_temporal (video_id, tags_suggest, confirm, date_creation)
                     VALUES (%s, %s, %s, %s)

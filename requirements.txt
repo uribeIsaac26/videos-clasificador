@@ -15,6 +15,7 @@ laion-clap
 
 # --- AUDIO (Correcciones para FFmpeg y lectura) ---
 librosa
+faster-whisper>=1.1.0   # detección de idioma hablado (incluye VAD Silero)
 soundfile
 audioread
 yt-dlp

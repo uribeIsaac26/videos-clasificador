@@ -31,6 +31,15 @@ python -c "from ia_video_service import diagnostico_memoria; diagnostico_memoria
 python medir_error_tags.py
 python medir_error_tags.py --desde 2026-10-01 --min-soporte 10 --csv errores.csv
 
+# Exclude language-review suggestions (they include the real tags) from the measurement
+python medir_error_tags.py --hasta 2026-10-15
+
+# Spoken-language tags for existing videos (one-off): remove manual language tags, then suggest detected ones
+python borrar_tags_idioma.py --dry-run          # default tags: Spanish English
+python borrar_tags_idioma.py
+python etiquetar_idioma_existentes.py --limite 20 --dry-run
+python etiquetar_idioma_existentes.py           # resumable; skips videos already in salidas/resultados_idioma.csv
+
 # Detect duplicates within a specific tag (tag is a CLI argument)
 python detectar_duplicados.py Nature
 python detectar_duplicados.py Nature --umbral 0.98
@@ -65,6 +74,14 @@ DB_DATABASE=...
 - Top-K=5 neighbors with similarity ≥ `UMBRAL_SIMILITUD` (0.20)
 - Weighted vote: tag wins if it reaches `UMBRAL_VOTO` (0.30) of total weight
 - Audio tags handled separately via binary detection (`hay_audio()`)
+- Language and `Music` tags are excluded from KNN voting; they come from `detectar_idioma.py` instead
+
+**Spoken language (`detectar_idioma.py`):**
+- faster-whisper (`MODELO_WHISPER = "small"`) + Silero VAD over 30 s windows at 0%, 40%, 75% of the video; language probabilities weighted by seconds of speech
+- Result: language tag in English (e.g. `Spanish`) if prob ≥ `UMBRAL_IDIOMA` (0.60); `Music` if there is sound but < `MIN_SEGUNDOS_VOZ` (3 s) of speech; nothing if silent or low confidence. Songs with lyrics count as speech
+- New language tags are created in `tag` (type `VIDEO`) via `asegurar_tags_video()` — the frontend drops suggestions whose tag doesn't exist
+- `etiquetar_idioma_existentes.py` writes suggestions to `video_tag_temporal` (confirm=0) as **current real tags + detected tag**, because confirming in the backend replaces ALL video tags with the suggestion. Overwritten temporal rows are backed up to `salidas/` first; their `date_creation` is reset, so use `medir_error_tags.py --hasta` to keep them out of error metrics
+- `borrar_tags_idioma.py` only deletes `video_tag` rows (never `tag` rows — shared with images/mangas) and strips those names from pending suggestions, with a CSV backup in `salidas/` (gitignored)
 
 **Duplicate detection:**
 - Tag name is passed as a CLI positional argument (`python detectar_duplicados.py <tag>`), not hardcoded

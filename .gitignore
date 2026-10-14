@@ -3,3 +3,4 @@ __pycache__/
 *.pkl
 memoria_multimodal_ia.pkl
 *.pkl.tmp
+salidas/
