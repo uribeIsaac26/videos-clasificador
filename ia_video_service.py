@@ -17,6 +17,7 @@ from sklearn.multioutput import MultiOutputClassifier
 from sklearn.linear_model import LogisticRegression
 from scipy.spatial.distance import cosine
 from detectar_idioma import detectar_idioma, asegurar_tags_video, TAGS_IDIOMA_Y_MUSICA
+from anonimizar import obtener_mapa_anonimo, anonimizar_tag
 import gc
 import warnings
 warnings.filterwarnings("ignore")
@@ -597,8 +598,11 @@ def regenerar_memoria():
     sincronizar_memoria()
 
 
-def diagnostico_memoria():
-    """Imprime un resumen de la memoria guardada."""
+def diagnostico_memoria(anonimizar=False):
+    """
+    Imprime un resumen de la memoria guardada.
+    anonimizar=True muestra el ID del tag (#37) en vez de su nombre.
+    """
     if not os.path.exists(MEMORIA_FILE):
         print("❌ No existe archivo de memoria.")
         return
@@ -616,6 +620,16 @@ def diagnostico_memoria():
     print(f"   Tags únicos        : {len(todos_tags)}")
     print(f"   Con audio          : {sum(1 for m in memoria if m['tiene_audio'])}")
     print(f"   Sin audio          : {sum(1 for m in memoria if not m['tiene_audio'])}")
+    if anonimizar:
+        conexion = conectar_db()
+        mapa = obtener_mapa_anonimo(conexion)
+        conexion.close()
+        anonimos = {}
+        for tag, count in todos_tags.items():
+            clave = anonimizar_tag(tag, mapa)
+            anonimos[clave] = anonimos.get(clave, 0) + count
+        todos_tags = anonimos
+
     print(f"\n   Distribución de tags:")
     for tag, count in sorted(todos_tags.items(), key=lambda x: -x[1]):
         barra = "█" * count

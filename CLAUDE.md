@@ -26,10 +26,12 @@ python -c "from ia_video_service import regenerar_memoria; regenerar_memoria()"
 
 # Print tag distribution and audio statistics for diagnostics
 python -c "from ia_video_service import diagnostico_memoria; diagnostico_memoria()"
+python -c "from ia_video_service import diagnostico_memoria; diagnostico_memoria(anonimizar=True)"
 
 # Measure per-tag classification error: confirmed suggestions (video_tag_temporal.confirm=1) vs final tags (video_tag)
 python medir_error_tags.py
 python medir_error_tags.py --desde 2026-10-01 --min-soporte 10 --csv errores.csv
+python medir_error_tags.py --anonimizar          # tag IDs (#37) instead of names, screen and CSV
 
 # Exclude language-review suggestions (they include the real tags) from the measurement
 python medir_error_tags.py --hasta 2026-10-15
@@ -98,6 +100,10 @@ DB_DATABASE=...
 **Persistence:**
 - `memoria_multimodal_ia.pkl` — cached embeddings for all training videos (gitignored). Kept in sync incrementally by `sincronizar_memoria()` before every batch: embeds only new tagged videos, refreshes tags of existing ones (no re-embedding), drops untagged ones, recomputes if `video_path` changed. Written atomically (`.tmp` + `os.replace`), checkpointed every `GUARDAR_CADA` (100) new videos. Videos whose file is missing or whose visual embedding fails are not stored and are retried on the next sync.
 - MySQL DB — source of video paths/tags and destination for classification/duplicate results
+
+## Tag Names Are Confidential
+
+The user cannot share real tag names. Never ask for them or for name listings. Reports meant to be shared must support `--anonimizar` / `anonimizar=True` (`anonimizar.py`: name → `#<tag.id>` of type `VIDEO`, `#?` if not found); refer to tags by ID. Only generic names already in code (Sound/No Sound, Music, language names) are known.
 
 ## Key Tuning Constants
 

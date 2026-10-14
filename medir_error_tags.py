@@ -5,6 +5,8 @@ import mysql.connector
 from datetime import datetime
 from dotenv import load_dotenv
 
+from anonimizar import obtener_mapa_anonimo, anonimizar_tag
+
 # ============================================================
 # CONFIGURACIÓN
 # ============================================================
@@ -226,9 +228,21 @@ def exportar_csv(filas, ruta):
 # PUNTO DE ENTRADA
 # ============================================================
 
-def medir_error_tags(desde=None, hasta=None, min_soporte=1, csv_path=None):
+def anonimizar_reporte(filas, confusiones):
+    """Cambia los nombres de tags por su ID ("#37") en la tabla y en las confusiones."""
+    conexion = conectar_db()
+    mapa = obtener_mapa_anonimo(conexion)
+    conexion.close()
+    filas = [{**f, "tag": anonimizar_tag(f["tag"], mapa)} for f in filas]
+    confusiones = [(anonimizar_tag(s, mapa), anonimizar_tag(f, mapa), n) for s, f, n in confusiones]
+    return filas, confusiones
+
+
+def medir_error_tags(desde=None, hasta=None, min_soporte=1, csv_path=None, anonimizar=False):
     pares = obtener_pares_sugerido_real(desde, hasta)
     filas, globales, confusiones = calcular_metricas(pares)
+    if anonimizar:
+        filas, confusiones = anonimizar_reporte(filas, confusiones)
     imprimir_reporte(filas, globales, confusiones, min_soporte)
     if csv_path:
         exportar_csv(filas, csv_path)
@@ -249,6 +263,9 @@ if __name__ == "__main__":
     parser.add_argument("--min-soporte", type=int, default=1,
                         help="Ocultar tags con menos de N videos reales y N sugerencias (default: 1)")
     parser.add_argument("--csv", help="Ruta para exportar las métricas por tag en CSV")
+    parser.add_argument("--anonimizar", action="store_true",
+                        help="Muestra el ID del tag (#37) en vez de su nombre, en pantalla y en el CSV")
     args = parser.parse_args()
 
-    medir_error_tags(desde=args.desde, hasta=args.hasta, min_soporte=args.min_soporte, csv_path=args.csv)
+    medir_error_tags(desde=args.desde, hasta=args.hasta, min_soporte=args.min_soporte,
+                     csv_path=args.csv, anonimizar=args.anonimizar)
