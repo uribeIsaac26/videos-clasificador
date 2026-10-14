@@ -6,14 +6,13 @@ Quita los tags de idioma puestos a mano para que etiquetar_idioma_existentes.py 
   - Quita esos tags de las sugerencias pendientes (`video_tag_temporal` con confirm = 0).
   - Antes de tocar nada guarda un CSV de respaldo en salidas/ para poder restaurar.
 
---revertir-sugerencias: deshace las sugerencias de etiquetar_idioma_existentes.py que siguen
-pendientes (confirm = 0), para volver a probar la detección desde cero:
-  - Si el video ya tenía fila en video_tag_temporal antes del script, se restaura la original
-    (sacada de salidas/respaldo_video_tag_temporal_idioma.csv).
-  - Si la fila la creó el script, se borra.
-  - Las sugerencias que ya confirmaste no se tocan.
-  - Se quitan de salidas/resultados_idioma.csv todos los videos salvo los ya confirmados, para
-    que el script los vuelva a procesar.
+--borrar-pendientes: borra TODAS las sugerencias pendientes de video_tag_temporal (confirm = 0),
+tanto las del script de idioma como las del clasificador, para empezar la prueba desde cero:
+  - Las sugerencias ya confirmadas no se tocan (ni video_tag).
+  - Guarda un CSV de respaldo con las filas borradas en salidas/.
+  - Quita de salidas/resultados_idioma.csv todos los videos sin sugerencia confirmada, para que
+    etiquetar_idioma_existentes.py los vuelva a procesar.
+  - Los videos sin etiquetar quedan sin sugerencia: procesar_lote() los vuelve a clasificar.
 """
 import os
 import csv
@@ -131,59 +130,41 @@ def _leer_csv(ruta):
         return list(csv.DictReader(f))
 
 
-def revertir_sugerencias_idioma(dry_run=False):
+def borrar_sugerencias_pendientes(dry_run=False):
     # Rutas de los archivos que escribe el script de etiquetado (fuente única)
     from etiquetar_idioma_existentes import ARCHIVO_RESULTADOS, ARCHIVO_RESPALDO
 
-    resultados = _leer_csv(ARCHIVO_RESULTADOS)
-    if not resultados:
-        print(f"✅ No hay {ARCHIVO_RESULTADOS}: no hay sugerencias de idioma que revertir.")
-        return
-
-    # Cuántas veces escribió el script la sugerencia de cada video
-    escrituras = {}
-    for r in resultados:
-        if r["accion"] in ("sugerido", "corregido"):
-            vid = int(r["video_id"])
-            escrituras[vid] = escrituras.get(vid, 0) + 1
-    ids_sugeridos = sorted(escrituras)
-
-    # Cada escritura sobre una fila existente deja un respaldo previo. Si una fila tiene tantos
-    # respaldos como escrituras, el primero es la fila original (anterior al script); si tiene
-    # uno menos, la primera escritura fue un INSERT (la fila la creó el script).
-    respaldos = _leer_csv(ARCHIVO_RESPALDO)
-    respaldos_por_id = {}
-    for fila in respaldos:
-        respaldos_por_id.setdefault(int(fila["id"]), []).append(fila)
-
     conexion = conectar_db()
     cursor   = conexion.cursor(dictionary=True)
+    cursor.execute("""
+        SELECT vtt.id, vtt.video_id, vtt.tags_suggest, vtt.confirm, vtt.date_creation,
+               EXISTS (SELECT 1 FROM video_tag vt WHERE vt.video_id = vtt.video_id) AS etiquetado
+        FROM video_tag_temporal vtt
+        WHERE vtt.confirm = FALSE
+    """)
+    pendientes = cursor.fetchall()
+    cursor.execute("SELECT video_id FROM video_tag_temporal WHERE confirm = TRUE")
+    confirmados = {f["video_id"] for f in cursor.fetchall()}
 
-    filas = []
-    if ids_sugeridos:
-        marcadores = ", ".join(["%s"] * len(ids_sugeridos))
-        cursor.execute(f"""
-            SELECT id, video_id, tags_suggest, confirm, date_creation
-            FROM video_tag_temporal WHERE video_id IN ({marcadores})
-        """, tuple(ids_sugeridos))
-        filas = cursor.fetchall()
-
-    pendientes  = [f for f in filas if not f["confirm"]]
-    confirmados = {f["video_id"] for f in filas if f["confirm"]}
-    originales  = {
-        f["id"]: respaldos_por_id[f["id"]][0] for f in pendientes
-        if len(respaldos_por_id.get(f["id"], [])) >= escrituras[f["video_id"]]
-    }
-    a_restaurar = [f for f in pendientes if f["id"] in originales]
-    a_borrar    = [f for f in pendientes if f["id"] not in originales]
+    resultados = _leer_csv(ARCHIVO_RESULTADOS)
+    ids_script = {int(r["video_id"]) for r in resultados}
     resultados_restantes = [r for r in resultados if int(r["video_id"]) in confirmados]
 
-    print(f"\n↩️  Sugerencias de idioma pendientes: {len(pendientes)}")
-    print(f"   · Se restauran a la sugerencia original : {len(a_restaurar)}")
-    print(f"   · Se borran (las creó el script)        : {len(a_borrar)}")
-    print(f"   · Ya confirmadas, no se tocan           : {len(confirmados)}")
-    print(f"   · Videos que se volverán a procesar     : "
-          f"{len({int(r['video_id']) for r in resultados}) - len(confirmados)}")
+    del_script     = sum(1 for f in pendientes if f["video_id"] in ids_script)
+    sin_etiquetar  = sum(1 for f in pendientes if not f["etiquetado"])
+    print(f"\n🧹 Sugerencias pendientes a borrar: {len(pendientes)}")
+    print(f"   · Del script de idioma                      : {del_script}")
+    print(f"   · Del clasificador u otras                  : {len(pendientes) - del_script}")
+    print(f"   · De videos sin etiquetar (se reclasifican) : {sin_etiquetar}")
+    print(f"   · Sugerencias confirmadas, no se tocan      : {len(confirmados)}")
+    print(f"   · Videos que el script de idioma reprocesará: "
+          f"{len(ids_script) - len({int(r['video_id']) for r in resultados_restantes})}")
+
+    if not pendientes and len(resultados_restantes) == len(resultados):
+        print("✅ No hay nada que borrar.")
+        cursor.close()
+        conexion.close()
+        return
 
     if dry_run:
         print("\n🔎 --dry-run: no se modificó nada.")
@@ -193,66 +174,58 @@ def revertir_sugerencias_idioma(dry_run=False):
 
     os.makedirs(CARPETA_SALIDAS, exist_ok=True)
     ruta_respaldo = os.path.join(
-        CARPETA_SALIDAS, f"respaldo_revertir_sugerencias_{datetime.now():%Y%m%d_%H%M%S}.csv"
+        CARPETA_SALIDAS, f"respaldo_borrado_pendientes_{datetime.now():%Y%m%d_%H%M%S}.csv"
     )
     with open(ruta_respaldo, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["id", "video_id", "tags_suggest", "confirm", "date_creation"])
+        writer = csv.DictWriter(f, fieldnames=["id", "video_id", "tags_suggest", "confirm", "date_creation"],
+                                extrasaction="ignore")
         writer.writeheader()
         writer.writerows(pendientes)
-    print(f"\n💾 Respaldo de las sugerencias actuales → {ruta_respaldo}")
+    print(f"\n💾 Respaldo de las sugerencias borradas → {ruta_respaldo}")
 
     try:
-        cursor.executemany(
-            "UPDATE video_tag_temporal SET tags_suggest = %s, confirm = %s, date_creation = %s WHERE id = %s",
-            [(originales[f["id"]]["tags_suggest"],
-              bool(int(originales[f["id"]]["confirm"] or 0)),
-              originales[f["id"]]["date_creation"] or None,
-              f["id"]) for f in a_restaurar]
-        )
-        cursor.executemany(
-            "DELETE FROM video_tag_temporal WHERE id = %s",
-            [(f["id"],) for f in a_borrar]
-        )
+        cursor.executemany("DELETE FROM video_tag_temporal WHERE id = %s AND confirm = FALSE",
+                           [(f["id"],) for f in pendientes])
         conexion.commit()
     except Exception:
         conexion.rollback()
-        print("❌ Error al revertir; no se aplicó ningún cambio.")
+        print("❌ Error al borrar; no se aplicó ningún cambio.")
         raise
     finally:
         cursor.close()
         conexion.close()
 
-    # Solo se reescriben los registros una vez confirmada la transacción. Los respaldos de las
-    # filas revertidas se quitan: esas filas vuelven a su estado previo al script (o ya no existen),
-    # así el conteo respaldos/escrituras sigue cuadrando en la próxima corrida.
-    with open(ARCHIVO_RESULTADOS, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=list(resultados[0].keys()))
-        writer.writeheader()
-        writer.writerows(resultados_restantes)
+    # Solo se reescriben los registros una vez confirmada la transacción
+    if resultados:
+        with open(ARCHIVO_RESULTADOS, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=list(resultados[0].keys()))
+            writer.writeheader()
+            writer.writerows(resultados_restantes)
 
-    ids_revertidos = {f["id"] for f in pendientes}
+    # Los respaldos de filas que ya no existen no sirven para restaurar nada
+    respaldos = _leer_csv(ARCHIVO_RESPALDO)
+    ids_borrados = {f["id"] for f in pendientes}
     if respaldos:
         with open(ARCHIVO_RESPALDO, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=list(respaldos[0].keys()))
             writer.writeheader()
-            writer.writerows(r for r in respaldos if int(r["id"]) not in ids_revertidos)
+            writer.writerows(r for r in respaldos if int(r["id"]) not in ids_borrados)
 
-    print(f"✅ Restauradas {len(a_restaurar)} y borradas {len(a_borrar)} sugerencias. "
-          f"Ya puedes volver a correr etiquetar_idioma_existentes.py.")
+    print(f"✅ Borradas {len(pendientes)} sugerencias pendientes.")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Quita tags de idioma puestos a mano de video_tag, o revierte las sugerencias de idioma pendientes."
+        description="Quita tags de idioma puestos a mano de video_tag, o borra todas las sugerencias pendientes."
     )
     parser.add_argument("--tags", nargs="+", default=TAGS_POR_DEFECTO,
                         help=f"Nombres de los tags a quitar (default: {' '.join(TAGS_POR_DEFECTO)})")
-    parser.add_argument("--revertir-sugerencias", action="store_true",
-                        help="Deshace las sugerencias pendientes de etiquetar_idioma_existentes.py para repetir la prueba")
+    parser.add_argument("--borrar-pendientes", action="store_true",
+                        help="Borra TODAS las sugerencias pendientes (confirm = 0) de video_tag_temporal")
     parser.add_argument("--dry-run", action="store_true", help="Solo muestra lo que se haría")
     args = parser.parse_args()
 
-    if args.revertir_sugerencias:
-        revertir_sugerencias_idioma(dry_run=args.dry_run)
+    if args.borrar_pendientes:
+        borrar_sugerencias_pendientes(dry_run=args.dry_run)
     else:
         borrar_tags_idioma(args.tags, dry_run=args.dry_run)
