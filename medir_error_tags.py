@@ -30,7 +30,7 @@ def conectar_db():
     )
 
 
-def obtener_pares_sugerido_real(desde=None):
+def obtener_pares_sugerido_real(desde=None, hasta=None):
     """
     Devuelve [(video_id, tags_sugeridos, tags_reales)] para cada sugerencia de la IA
     que ya fue confirmada/corregida. Los tags reales salen de video_tag (lo que quedó
@@ -39,7 +39,14 @@ def obtener_pares_sugerido_real(desde=None):
     conexion = conectar_db()
     cursor   = conexion.cursor(dictionary=True)
 
-    filtro_fecha = "AND vtt.date_creation >= %s" if desde else ""
+    filtros, params = [], []
+    if desde:
+        filtros.append("AND vtt.date_creation >= %s")
+        params.append(desde)
+    if hasta:
+        filtros.append("AND vtt.date_creation < %s")
+        params.append(hasta)
+    filtro_fecha = " ".join(filtros)
     cursor.execute(f"""
         SELECT vtt.video_id, vtt.tags_suggest,
                GROUP_CONCAT(t.name SEPARATOR ',') AS tags_reales
@@ -48,7 +55,7 @@ def obtener_pares_sugerido_real(desde=None):
         JOIN tag t ON t.id = vt.tag_id
         WHERE vtt.confirm = TRUE {filtro_fecha}
         GROUP BY vtt.video_id, vtt.tags_suggest
-    """, (desde,) if desde else ())
+    """, tuple(params))
     filas = cursor.fetchall()
     cursor.close()
     conexion.close()
@@ -219,8 +226,8 @@ def exportar_csv(filas, ruta):
 # PUNTO DE ENTRADA
 # ============================================================
 
-def medir_error_tags(desde=None, min_soporte=1, csv_path=None):
-    pares = obtener_pares_sugerido_real(desde)
+def medir_error_tags(desde=None, hasta=None, min_soporte=1, csv_path=None):
+    pares = obtener_pares_sugerido_real(desde, hasta)
     filas, globales, confusiones = calcular_metricas(pares)
     imprimir_reporte(filas, globales, confusiones, min_soporte)
     if csv_path:
@@ -235,9 +242,13 @@ if __name__ == "__main__":
     parser.add_argument("--desde", type=lambda s: datetime.strptime(s, "%Y-%m-%d"),
                         help="Solo sugerencias creadas desde esta fecha (YYYY-MM-DD). "
                              "Útil para medir el efecto de un cambio en el clasificador.")
+    parser.add_argument("--hasta", type=lambda s: datetime.strptime(s, "%Y-%m-%d"),
+                        help="Solo sugerencias creadas antes de esta fecha (YYYY-MM-DD). Úsalo para "
+                             "excluir las sugerencias de idioma de etiquetar_idioma_existentes.py, que "
+                             "incluyen los tags reales del video y subirían artificialmente las métricas.")
     parser.add_argument("--min-soporte", type=int, default=1,
                         help="Ocultar tags con menos de N videos reales y N sugerencias (default: 1)")
     parser.add_argument("--csv", help="Ruta para exportar las métricas por tag en CSV")
     args = parser.parse_args()
 
-    medir_error_tags(desde=args.desde, min_soporte=args.min_soporte, csv_path=args.csv)
+    medir_error_tags(desde=args.desde, hasta=args.hasta, min_soporte=args.min_soporte, csv_path=args.csv)
