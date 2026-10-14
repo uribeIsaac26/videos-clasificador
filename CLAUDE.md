@@ -27,6 +27,10 @@ python -c "from ia_video_service import regenerar_memoria; regenerar_memoria()"
 # Print tag distribution and audio statistics for diagnostics
 python -c "from ia_video_service import diagnostico_memoria; diagnostico_memoria()"
 
+# Measure per-tag classification error: confirmed suggestions (video_tag_temporal.confirm=1) vs final tags (video_tag)
+python medir_error_tags.py
+python medir_error_tags.py --desde 2026-10-01 --min-soporte 10 --csv errores.csv
+
 # Detect duplicates within a specific tag (tag is a CLI argument)
 python detectar_duplicados.py Nature
 python detectar_duplicados.py Nature --umbral 0.98
