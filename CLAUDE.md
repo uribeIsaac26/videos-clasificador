@@ -40,6 +40,7 @@ python borrar_tags_idioma.py
 python etiquetar_idioma_existentes.py --limite 20 --dry-run
 python etiquetar_idioma_existentes.py           # resumable; skips videos already in salidas/resultados_idioma.csv
 python etiquetar_idioma_existentes.py --corregir-music   # fix Music suggested by the old version (noise tagged as Music)
+python borrar_tags_idioma.py --revertir-sugerencias --dry-run   # undo PENDING language suggestions to rerun the test
 
 # Detect duplicates within a specific tag (tag is a CLI argument)
 python detectar_duplicados.py Nature
@@ -84,7 +85,8 @@ DB_DATABASE=...
 - Result (`"tags"` list): noise → nothing (keeps `Sound`); instrumental → `Music`; song with lyrics → `Music` + lyrics language; speech (with or without background music) → language
 - New language tags are created in `tag` (type `VIDEO`) via `asegurar_tags_video()` — the frontend drops suggestions whose tag doesn't exist
 - `etiquetar_idioma_existentes.py` writes suggestions to `video_tag_temporal` (confirm=0) as **current real tags + detected tag**, because confirming in the backend replaces ALL video tags with the suggestion. Overwritten temporal rows are backed up to `salidas/` first; their `date_creation` is reset, so use `medir_error_tags.py --hasta` to keep them out of error metrics
-- `borrar_tags_idioma.py` only deletes `video_tag` rows (never `tag` rows — shared with images/mangas) and strips those names from pending suggestions, with a CSV backup in `salidas/` (gitignored)
+- `borrar_tags_idioma.py --revertir-sugerencias`: for pending (confirm=0) rows written by `etiquetar_idioma_existentes.py`, restores the pre-script row from the backup CSV, or deletes it if the script created it (decided by comparing backups vs. writes per video); confirmed ones are untouched; clears `salidas/resultados_idioma.csv` (except confirmed) so videos get reprocessed
+- `borrar_tags_idioma.py` (default mode) only deletes `video_tag` rows (never `tag` rows — shared with images/mangas) and strips those names from pending suggestions, with a CSV backup in `salidas/` (gitignored)
 
 **Duplicate detection:**
 - Tag name is passed as a CLI positional argument (`python detectar_duplicados.py <tag>`), not hardcoded
